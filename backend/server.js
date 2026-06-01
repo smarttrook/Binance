@@ -27,7 +27,7 @@ let appState = {
     asset: "BTC",
     timeframe: "1m",
     symbol: defaultFuturesSymbol,
-    leverage: 5,
+    leverage: 5, // الرافعة — تنطبق على كل الاستراتيجيات
     tradeAmount: 10,
     baseProfitTarget: 1,
     stopLoss: 1,
@@ -49,7 +49,9 @@ let appState = {
     losses: 0,
     winRate: 0,
     lastError: null,
-    tradeState: "neutral"
+    tradeState: "neutral",
+    livePrice: 0,        // السعر الحي اللحظي من بينانس
+    livePnl: 0           // الربح/الخسارة الحالي للصفقة المفتوحة
   },
   logs: [],
   tradeLogs: [],
@@ -71,6 +73,9 @@ function loadState() {
     if (data && typeof data === "object") {
       appState = { ...appState, ...data };
       appState.status.running = false; // دائماً يبدأ متوقفاً بعد إعادة تشغيل السيرفر
+      // ضمان وجود الحقول الجديدة بعد التحديث
+      if (typeof appState.status.livePrice !== "number") appState.status.livePrice = 0;
+      if (typeof appState.status.livePnl !== "number") appState.status.livePnl = 0;
     }
   } catch {}
 }
@@ -93,7 +98,7 @@ function addTradeLog(result, amount, side, strategy = "-") {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// ─── دوال بينانس (جلب بيانات فقط) ───
+// ─── دوال بينانس (جلب بيانات فقط - أسعار حيّة حقيقية) ───
 async function getCurrentFuturesPrice(symbol = defaultFuturesSymbol) {
   try {
     const r = await axios.get(`${binanceFuturesBaseUrl}/fapi/v1/ticker/price`, {
@@ -127,7 +132,7 @@ function average(values) {
 async function analyzeFuturesMarket() {
   const symbol = String(appState.config.symbol || defaultFuturesSymbol).toUpperCase();
   const rows = await getFuturesKlines(symbol, appState.config.timeframe, 35);
-  
+
   if (rows.length < 25) {
     addLog("⏳ جاري انتظار اكتمال بيانات الشموع من بينانس...");
     return null;
@@ -136,7 +141,7 @@ async function analyzeFuturesMarket() {
   const closes = rows.map((r) => Number(r[4])).filter((n) => Number.isFinite(n) && n > 0);
   const last = closes[closes.length - 1];
   const prev = closes[closes.length - 2];
-  
+
   // استراتيجية تقاطع EMA البسيطة كأساس (يمكنك تعديل خلطة المؤشرات هنا لاحقاً)
   const emaFast = average(closes.slice(-7));
   const emaSlow = average(closes.slice(-21));
@@ -150,13 +155,9 @@ async function analyzeFuturesMarket() {
   if (appState.config.direction === "buy" && side === "sell") side = null;
   if (appState.config.direction === "sell" && side === "buy") side = null;
 
-  if (!side) {
-    // يمكن تفعيل هذا السطر أثناء الاختبار فقط لتقليل الإزعاج في السجلات
-    // addLog(`⏸️ لا توجد إشارة تداول | السعر=${last}`);
-    return null;
-  }
+  if (!side) return null;
 
-  return { side, symbol, entryPrice: last, strategyText: "sim_trend_strategy" };
+  return { side, symbol, strategyText: "sim_trend_strategy" };
 }
 
 function getRecoveryTargetProfit() {
@@ -167,14 +168,18 @@ function getRecoveryTargetProfit() {
 }
 
 async function executeSimTrade(pending) {
+  // ✅ إصلاح الفجوة: نلتقط السعر الحي الحقيقي لحظة الفتح (مو سعر شمعة مغلقة)
+  const liveEntry = await getCurrentFuturesPrice(pending.symbol);
+  const entryPrice = liveEntry > 0 ? liveEntry : pending.entryPrice;
+
   const notional = Number(pending.amount) * Number(pending.leverage);
-  const qty = notional / pending.entryPrice;
+  const qty = notional / entryPrice;
 
   const targetDistance = Number(pending.targetProfit) / qty;
   const stopDistance = Number(pending.stopLoss) / qty;
 
-  const takeProfitPrice = pending.side === "buy" ? pending.entryPrice + targetDistance : pending.entryPrice - targetDistance;
-  const stopLossPrice = pending.side === "buy" ? pending.entryPrice - stopDistance : pending.entryPrice + stopDistance;
+  const takeProfitPrice = pending.side === "buy" ? entryPrice + targetDistance : entryPrice - targetDistance;
+  const stopLossPrice = pending.side === "buy" ? entryPrice - stopDistance : entryPrice + stopDistance;
 
   appState.status.currentTrade = {
     id: crypto.randomUUID(),
@@ -182,16 +187,21 @@ async function executeSimTrade(pending) {
     symbol: pending.symbol,
     amount: pending.amount,
     leverage: pending.leverage,
+    qty,
     targetProfit: pending.targetProfit,
     stopLoss: pending.stopLoss,
-    entryPrice: pending.entryPrice,
+    entryPrice,
     takeProfitPrice,
     stopLossPrice,
     strategy: pending.strategy,
-    openedAt: new Date().toISOString()
+    openedAt: new Date().toISOString(),
+    pnlChart: [{ t: Date.now(), price: entryPrice, pnl: 0 }] // نقطة بداية الشارت
   };
 
-  addLog(`📄 صفقة محاكاة جديدة [${pending.side.toUpperCase()}] | السعر: ${pending.entryPrice} | الهدف: ${takeProfitPrice.toFixed(2)} | الوقف: ${stopLossPrice.toFixed(2)}`);
+  appState.status.livePrice = entryPrice;
+  appState.status.livePnl = 0;
+
+  addLog(`📄 صفقة محاكاة جديدة [${pending.side.toUpperCase()}] | الرافعة: x${pending.leverage} | الدخول: ${entryPrice.toFixed(2)} | الهدف: ${takeProfitPrice.toFixed(2)} | الوقف: ${stopLossPrice.toFixed(2)}`);
   saveState();
 }
 
@@ -202,10 +212,19 @@ async function resolveSimTrade() {
   const currentPrice = await getCurrentFuturesPrice(t.symbol);
   if (!currentPrice) return;
 
-  // تحديث حالة الصفقة للمنصة (رابحة أم خاسرة حالياً)
-  appState.status.tradeState = t.side === "buy" 
-    ? (currentPrice >= t.entryPrice ? "win" : "loss") 
-    : (currentPrice <= t.entryPrice ? "win" : "loss");
+  // ── حساب الربح/الخسارة اللحظي بالدولار ──
+  const priceDiff = t.side === "buy" ? (currentPrice - t.entryPrice) : (t.entryPrice - currentPrice);
+  const livePnl = Math.round((priceDiff * Number(t.qty)) * 100) / 100;
+
+  appState.status.livePrice = currentPrice;
+  appState.status.livePnl = livePnl;
+
+  // إضافة نقطة لشارت الربح/الخسارة (نحتفظ بآخر 300 نقطة)
+  t.pnlChart.push({ t: Date.now(), price: currentPrice, pnl: livePnl });
+  if (t.pnlChart.length > 300) t.pnlChart = t.pnlChart.slice(-300);
+
+  // حالة الصفقة للمنصة (رابحة أم خاسرة حالياً)
+  appState.status.tradeState = livePnl >= 0 ? "win" : "loss";
 
   const won = t.side === "buy" ? currentPrice >= t.takeProfitPrice : currentPrice <= t.takeProfitPrice;
   const lost = t.side === "buy" ? currentPrice <= t.stopLossPrice : currentPrice >= t.stopLossPrice;
@@ -237,6 +256,7 @@ function closeTrade() {
   appState.status.winRate = (appState.status.wins / appState.status.resolvedTrades) * 100;
   appState.status.currentTrade = null;
   appState.status.tradeState = "neutral";
+  appState.status.livePnl = 0;
 
   if (appState.status.totalProfit >= Number(appState.config.profitTarget)) {
     appState.status.running = false;
@@ -259,7 +279,7 @@ async function botLoop() {
     try {
       if (appState.status.currentTrade) {
         await resolveSimTrade();
-        await sleep(3000); // تحديث سريع أثناء وجود صفقة مفتوحة
+        await sleep(2000); // تحديث سريع أثناء وجود صفقة مفتوحة (شارت لحظي)
         continue;
       }
 
@@ -277,7 +297,7 @@ async function botLoop() {
 
       const targetProfit = getRecoveryTargetProfit();
       const stopLoss = Number(appState.config.stopLoss || 1);
-      
+
       const pending = {
         side: signal.side,
         symbol: signal.symbol,
@@ -285,7 +305,7 @@ async function botLoop() {
         leverage: Number(appState.config.leverage || 5),
         targetProfit,
         stopLoss,
-        entryPrice: signal.entryPrice,
+        entryPrice: 0, // سيُلتقط حيّاً داخل executeSimTrade
         strategy: signal.strategyText
       };
 
@@ -321,11 +341,38 @@ app.get("/api/all", async (req, res) => {
 });
 
 app.get("/api/logs", (req, res) => {
-  res.json({ 
-    ok: true, 
-    logs: appState.logs, 
-    trade_logs: appState.tradeLogs, 
-    full_trade_logs: appState.fullTradeLogs 
+  res.json({
+    ok: true,
+    logs: appState.logs,
+    trade_logs: appState.tradeLogs,
+    full_trade_logs: appState.fullTradeLogs
+  });
+});
+
+// ✅ رابط جديد: شارت الربح/الخسارة اللحظي للصفقة المفتوحة
+app.get("/api/trade-chart", (req, res) => {
+  const t = appState.status.currentTrade;
+  if (!t) {
+    return res.json({
+      ok: true,
+      open: false,
+      livePrice: appState.status.livePrice,
+      livePnl: 0,
+      points: []
+    });
+  }
+  res.json({
+    ok: true,
+    open: true,
+    side: t.side,
+    symbol: t.symbol,
+    entryPrice: t.entryPrice,
+    takeProfitPrice: t.takeProfitPrice,
+    stopLossPrice: t.stopLossPrice,
+    leverage: t.leverage,
+    livePrice: appState.status.livePrice,
+    livePnl: appState.status.livePnl,
+    points: t.pnlChart // [{ t, price, pnl }, ...]
   });
 });
 
@@ -356,6 +403,8 @@ app.post("/api/start", (req, res) => {
   appState.status.winRate = 0;
   appState.status.lastError = null;
   appState.status.tradeState = "neutral";
+  appState.status.livePrice = 0;
+  appState.status.livePnl = 0;
   appState.tradeLogs = [];
   appState.lastSignalKey = null;
   saveState();
