@@ -1,5 +1,5 @@
 {
-  "name": "trook-bot-turnkey-frontend",
+  "name": "trook-bot-binance-frontend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
@@ -8,7 +8,6 @@
     "start": "next start -p 3000"
   },
   "dependencies": {
-    "@privy-io/react-auth": "^1.95.0",
     "next": "14.2.35",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
