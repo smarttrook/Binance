@@ -1,0 +1,17 @@
+{
+  "type": "module",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "@privy-io/server-auth": "latest",
+    "axios": "latest",
+    "cors": "latest",
+    "ethers": "^6.13.0",
+    "express": "latest",
+    "nodemailer": "latest",
+    "pdfkit": "latest",
+    "technicalindicators": "latest",
+    "pg": "latest"
+  }
+}
