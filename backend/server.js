@@ -11,11 +11,18 @@ app.use(express.json({ limit: "2mb" }));
 
 const port = process.env.PORT || 8080;
 
-// نستخدم واجهة بينانس العامة (Mainnet) لأنها أفضل وأسرع للأسعار العامة والشموع
-const binanceFuturesBaseUrl = "https://fapi.binance.com";
-const defaultFuturesSymbol = "BTCUSDT";
-const binanceKlinesUrl = `${binanceFuturesBaseUrl}/fapi/v1/klines`;
+// ✅ تم التبديل من بينانس (محظور على Railway) إلى OKX — واجهة عامة مجانية ولا تُحجب
+const okxBaseUrl = "https://www.okx.com";
+const defaultFuturesSymbol = "BTC-USDT-SWAP"; // رمز عقد البيتكوين الدائم في OKX
+const okxCandlesUrl = `${okxBaseUrl}/api/v5/market/candles`;
+const okxTickerUrl = `${okxBaseUrl}/api/v5/market/ticker`;
 const stateFile = "./sim-state.json";
+
+// تحويل الفريمات من صيغة بينانس إلى صيغة OKX (OKX يستخدم حرف كبير للدقائق/الساعات أحياناً)
+function toOkxBar(tf) {
+  const map = { "1m": "1m", "3m": "3m", "5m": "5m", "15m": "15m", "30m": "30m", "1h": "1H", "2h": "2H", "4h": "4H", "1d": "1D" };
+  return map[String(tf || "1m")] || "1m";
+}
 
 // قائمة المؤشرات للاستراتيجيات (الخلطة)
 const allowedIndicators = ["nebula", "flash", "titan", "phantom", "smart_trook", "turbo"];
@@ -26,7 +33,7 @@ let appState = {
   config: {
     asset: "BTC",
     timeframe: "1m",
-    symbol: defaultFuturesSymbol,
+    symbol: defaultFuturesSymbol, // BTC-USDT-SWAP
     leverage: 5, // الرافعة — تنطبق على كل الاستراتيجيات
     tradeAmount: 10,
     baseProfitTarget: 1,
@@ -98,14 +105,16 @@ function addTradeLog(result, amount, side, strategy = "-") {
 
 function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
 
-// ─── دوال بينانس (جلب بيانات فقط - أسعار حيّة حقيقية) ───
+// ─── دوال OKX (جلب بيانات فقط - أسعار حيّة حقيقية) ───
 async function getCurrentFuturesPrice(symbol = defaultFuturesSymbol) {
   try {
-    const r = await axios.get(`${binanceFuturesBaseUrl}/fapi/v1/ticker/price`, {
-      params: { symbol },
+    const r = await axios.get(okxTickerUrl, {
+      params: { instId: symbol },
       timeout: 10000
     });
-    return Number(r.data?.price || 0);
+    // OKX يرجّع: { code:"0", data:[ { last:"...", ... } ] }
+    const last = r.data?.data?.[0]?.last;
+    return Number(last || 0);
   } catch {
     return 0;
   }
@@ -113,11 +122,15 @@ async function getCurrentFuturesPrice(symbol = defaultFuturesSymbol) {
 
 async function getFuturesKlines(symbol = defaultFuturesSymbol, interval = "1m", limit = 60) {
   try {
-    const r = await axios.get(binanceKlinesUrl, {
-      params: { symbol, interval, limit },
+    const r = await axios.get(okxCandlesUrl, {
+      params: { instId: symbol, bar: toOkxBar(interval), limit },
       timeout: 15000
     });
-    return Array.isArray(r.data) ? r.data : [];
+    const rows = r.data?.data;
+    if (!Array.isArray(rows)) return [];
+    // ⚠️ مهم: OKX يرجّع الشموع من الأحدث للأقدم — نعكسها لتصير الأقدم أولاً (مثل بينانس)
+    // صيغة شمعة OKX: [ts, open, high, low, close, vol, ...] — الإغلاق في الفهرس 4 (نفس بينانس)
+    return rows.slice().reverse();
   } catch {
     return [];
   }
@@ -381,7 +394,7 @@ app.post("/api/config", (req, res) => {
   appState.config = {
     ...appState.config,
     ...c,
-    symbol: String(c.symbol || appState.config.symbol).toUpperCase(),
+    symbol: String(c.symbol || appState.config.symbol).toUpperCase(), // BTC-USDT-SWAP — الشرطات تبقى
     leverage: Math.max(1, Math.min(125, Number(c.leverage || appState.config.leverage))),
     selectedIndicators: Array.isArray(c.selectedIndicators || c.selected_indicators)
       ? (c.selectedIndicators || c.selected_indicators).filter(x => allowedIndicators.includes(x))
